@@ -4,21 +4,14 @@
 **/__pycache__/
 **/.conda/
 
+#Ignore cursor rules
+.cursor/
+
 # ignore test files in root dir
 /*.test.py
 
-# Ignore git internal files (for bundler)
-.git/
-
 # Ignore all contents of the virtual environment directory
 .venv/
-
-# Handle bundle directory
-bundle/*/
-!bundle/mac_pkg_scripts
-
-# Handle work_dir directory
-work_dir/*
 
 # Handle memory directory
 memory/**

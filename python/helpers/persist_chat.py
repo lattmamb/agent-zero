@@ -2,10 +2,10 @@ from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 import uuid
-from agent import Agent, AgentConfig, AgentContext
+from agent import Agent, AgentConfig, AgentContext, AgentContextType
 from python.helpers import files, history
 import json
-from initialize import initialize
+from initialize import initialize_agent
 
 from python.helpers.log import Log, LogItem
 
@@ -29,11 +29,24 @@ def get_chat_folder_path(ctxid: str):
 
 def save_tmp_chat(context: AgentContext):
     """Save context to the chats folder"""
+    # Skip saving BACKGROUND contexts as they should be ephemeral
+    if context.type == AgentContextType.BACKGROUND:
+        return
+
     path = _get_chat_file_path(context.id)
     files.make_dirs(path)
     data = _serialize_context(context)
     js = _safe_json_serialize(data, ensure_ascii=False)
     files.write_file(path, js)
+
+
+def save_tmp_chats():
+    """Save all contexts to the chats folder"""
+    for _, context in AgentContext._contexts.items():
+        # Skip BACKGROUND contexts as they should be ephemeral
+        if context.type == AgentContextType.BACKGROUND:
+            continue
+        save_tmp_chat(context)
 
 
 def load_tmp_chats():
@@ -109,6 +122,11 @@ def _serialize_context(context: AgentContext):
             context.created_at.isoformat() if context.created_at
             else datetime.fromtimestamp(0).isoformat()
         ),
+        "type": context.type.value,
+        "last_message": (
+            context.last_message.isoformat() if context.last_message
+            else datetime.fromtimestamp(0).isoformat()
+        ),
         "agents": agents,
         "streaming_agent": (
             context.streaming_agent.number if context.streaming_agent else 0
@@ -141,7 +159,7 @@ def _serialize_log(log: Log):
 
 
 def _deserialize_context(data):
-    config = initialize()
+    config = initialize_agent()
     log = _deserialize_log(data.get("log", None))
 
     context = AgentContext(
@@ -154,6 +172,12 @@ def _deserialize_context(data):
                 data.get("created_at", datetime.fromtimestamp(0).isoformat())
             )
         ),
+        type=AgentContextType(data.get("type", AgentContextType.USER.value)),
+        last_message=(
+            datetime.fromisoformat(
+                data.get("last_message", datetime.fromtimestamp(0).isoformat())
+            )
+        ),
         log=log,
         paused=False,
         # agent0=agent0,
@@ -163,7 +187,7 @@ def _deserialize_context(data):
     agents = data.get("agents", [])
     agent0 = _deserialize_agents(agents, config, context)
     streaming_agent = agent0
-    while streaming_agent.number != data.get("streaming_agent", 0):
+    while streaming_agent and streaming_agent.number != data.get("streaming_agent", 0):
         streaming_agent = streaming_agent.data.get(Agent.DATA_NAME_SUBORDINATE, None)
 
     context.agent0 = agent0

@@ -1,6 +1,5 @@
-from flask import Request, Response
+from python.helpers.api import ApiHandler, Request, Response
 from python.helpers import runtime
-from python.helpers.api import ApiHandler
 from python.helpers.tunnel_manager import TunnelManager
 
 class Tunnel(ApiHandler):
@@ -14,7 +13,8 @@ class Tunnel(ApiHandler):
         
         if action == "create":
             port = runtime.get_web_ui_port()
-            tunnel_url = tunnel_manager.start_tunnel(port)
+            provider = input.get("provider", "serveo")  # Default to serveo
+            tunnel_url = tunnel_manager.start_tunnel(port, provider)
             if tunnel_url is None:
                 # Add a little delay and check again - tunnel might be starting
                 import time

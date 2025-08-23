@@ -1,6 +1,11 @@
 # SearXNG settings
 
-use_default_settings: true
+use_default_settings:
+  engines:
+    remove:
+      - radio browser
+# TODO enable radio_browser when it works again
+# currently it crashes on x86 on gethostbyaddr
 
 general:
   debug: false
@@ -16,6 +21,7 @@ search:
 server:
   # Is overwritten by ${SEARXNG_SECRET}
   secret_key: "dummy"
+  port: 55510
   limiter: false
   image_proxy: false
   # public URL of the instance, to ensure correct inbound links. Is overwritten
@@ -57,6 +63,12 @@ enabled_plugins:
 #     - '(.*\.)?wikipedia.org$'
 
 engines:
+  - name: radio browser
+    engine: radio_browser
+    disabled: true
+    inactive: true
+# TODO enable radio_browser when it works again
+# currently it crashes on x86 on gethostbyaddr
 
 #   - name: fdroid
 #     disabled: false

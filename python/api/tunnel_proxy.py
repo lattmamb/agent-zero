@@ -1,6 +1,5 @@
-from flask import Request, Response
+from python.helpers.api import ApiHandler, Request, Response
 from python.helpers import dotenv, runtime
-from python.helpers.api import ApiHandler
 from python.helpers.tunnel_manager import TunnelManager
 import requests
 
@@ -11,7 +10,7 @@ class TunnelProxy(ApiHandler):
         tunnel_api_port = (
             runtime.get_arg("tunnel_api_port")
             or int(dotenv.get_dotenv_value("TUNNEL_API_PORT", 0))
-            or 5070
+            or 55520
         )
 
         # first verify the service is running:

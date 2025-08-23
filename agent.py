@@ -1,31 +1,42 @@
 import asyncio
+import nest_asyncio
+
+nest_asyncio.apply()
+
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
-import json
-from typing import Any, Awaitable, Coroutine, Optional, Dict, TypedDict
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Coroutine, Dict
+from enum import Enum
 import uuid
 import models
 
-from python.helpers import extract_tools, rate_limiter, files, errors, history, tokens
+from python.helpers import extract_tools, files, errors, history, tokens
 from python.helpers import dirty_json
 from python.helpers.print_style import PrintStyle
 from langchain_core.prompts import (
     ChatPromptTemplate,
 )
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
 
 import python.helpers.log as Log
 from python.helpers.dirty_json import DirtyJson
 from python.helpers.defer import DeferredTask
 from typing import Callable
 from python.helpers.localization import Localization
+from python.helpers.extension import call_extensions
+
+class AgentContextType(Enum):
+    USER = "user"
+    TASK = "task"
+    BACKGROUND = "background"
 
 
 class AgentContext:
 
     _contexts: dict[str, "AgentContext"] = {}
     _counter: int = 0
+    _notification_manager = None
 
     def __init__(
         self,
@@ -37,6 +48,8 @@ class AgentContext:
         paused: bool = False,
         streaming_agent: "Agent|None" = None,
         created_at: datetime | None = None,
+        type: AgentContextType = AgentContextType.USER,
+        last_message: datetime | None = None,
     ):
         # build context
         self.id = id or str(uuid.uuid4())
@@ -47,9 +60,12 @@ class AgentContext:
         self.paused = paused
         self.streaming_agent = streaming_agent
         self.task: DeferredTask | None = None
-        self.created_at = created_at or datetime.now()
+        self.created_at = created_at or datetime.now(timezone.utc)
+        self.type = type
         AgentContext._counter += 1
         self.no = AgentContext._counter
+        # set to start of unix epoch
+        self.last_message = last_message or datetime.now(timezone.utc)
 
         existing = self._contexts.get(self.id, None)
         if existing:
@@ -67,6 +83,17 @@ class AgentContext:
         return list(AgentContext._contexts.values())[0]
 
     @staticmethod
+    def all():
+        return list(AgentContext._contexts.values())
+
+    @classmethod
+    def get_notification_manager(cls):
+        if cls._notification_manager is None:
+            from python.helpers.notification import NotificationManager
+            cls._notification_manager = NotificationManager()
+        return cls._notification_manager
+
+    @staticmethod
     def remove(id: str):
         context = AgentContext._contexts.pop(id, None)
         if context and context.task:
@@ -79,17 +106,41 @@ class AgentContext:
             "name": self.name,
             "created_at": (
                 Localization.get().serialize_datetime(self.created_at)
-                if self.created_at else Localization.get().serialize_datetime(datetime.fromtimestamp(0))
+                if self.created_at
+                else Localization.get().serialize_datetime(datetime.fromtimestamp(0))
             ),
             "no": self.no,
             "log_guid": self.log.guid,
             "log_version": len(self.log.updates),
             "log_length": len(self.log.logs),
             "paused": self.paused,
+            "last_message": (
+                Localization.get().serialize_datetime(self.last_message)
+                if self.last_message
+                else Localization.get().serialize_datetime(datetime.fromtimestamp(0))
+            ),
+            "type": self.type.value,
         }
 
-    def get_created_at(self):
-        return self.created_at
+    @staticmethod
+    def log_to_all(
+        type: Log.Type,
+        heading: str | None = None,
+        content: str | None = None,
+        kvps: dict | None = None,
+        temp: bool | None = None,
+        update_progress: Log.ProgressUpdate | None = None,
+        id: str | None = None,  # Add id parameter
+        **kwargs,
+    ) -> list[Log.LogItem]:
+        items: list[Log.LogItem] = []
+        for context in AgentContext.all():
+            items.append(
+                context.log.log(
+                    type, heading, content, kvps, temp, update_progress, id, **kwargs
+                )
+            )
+        return items
 
     def kill_process(self):
         if self.task:
@@ -105,21 +156,16 @@ class AgentContext:
     def nudge(self):
         self.kill_process()
         self.paused = False
-        if self.streaming_agent:
-            current_agent = self.streaming_agent
-        else:
-            current_agent = self.agent0
-
-        self.task = self.run_task(current_agent.monologue)
+        self.task = self.run_task(self.get_agent().monologue)
         return self.task
+
+    def get_agent(self):
+        return self.streaming_agent or self.agent0
 
     def communicate(self, msg: "UserMessage", broadcast_level: int = 1):
         self.paused = False  # unpause if paused
 
-        if self.streaming_agent:
-            current_agent = self.streaming_agent
-        else:
-            current_agent = self.agent0
+        current_agent = self.get_agent()
 
         if self.task and self.task.is_alive():
             # set intervention messages to agent(s):
@@ -164,39 +210,17 @@ class AgentContext:
             agent.handle_critical_exception(e)
 
 
-@dataclass
-class ModelConfig:
-    provider: models.ModelProvider
-    name: str
-    ctx_length: int = 0
-    limit_requests: int = 0
-    limit_input: int = 0
-    limit_output: int = 0
-    vision: bool = False
-    kwargs: dict = field(default_factory=dict)
-
 
 @dataclass
 class AgentConfig:
-    chat_model: ModelConfig
-    utility_model: ModelConfig
-    embeddings_model: ModelConfig
-    browser_model: ModelConfig
-    prompts_subdir: str = ""
+    chat_model: models.ModelConfig
+    utility_model: models.ModelConfig
+    embeddings_model: models.ModelConfig
+    browser_model: models.ModelConfig
+    mcp_servers: str
+    profile: str = ""
     memory_subdir: str = ""
     knowledge_subdirs: list[str] = field(default_factory=lambda: ["default", "custom"])
-    code_exec_docker_enabled: bool = False
-    code_exec_docker_name: str = "A0-dev"
-    code_exec_docker_image: str = "frdel/agent-zero-run:development"
-    code_exec_docker_ports: dict[str, int] = field(
-        default_factory=lambda: {"22/tcp": 55022, "80/tcp": 55080}
-    )
-    code_exec_docker_volumes: dict[str, dict[str, str]] = field(
-        default_factory=lambda: {
-            files.get_base_dir(): {"bind": "/a0", "mode": "rw"},
-            files.get_abs_path("work_dir"): {"bind": "/root", "mode": "rw"},
-        }
-    )
     code_exec_ssh_enabled: bool = True
     code_exec_ssh_addr: str = "localhost"
     code_exec_ssh_port: int = 55022
@@ -221,6 +245,8 @@ class LoopData:
         self.extras_temporary: OrderedDict[str, history.MessageContent] = OrderedDict()
         self.extras_persistent: OrderedDict[str, history.MessageContent] = OrderedDict()
         self.last_response = ""
+        self.params_temporary: dict = {}
+        self.params_persistent: dict = {}
 
         # override values with kwargs
         for key, value in kwargs.items():
@@ -255,16 +281,22 @@ class Agent:
         self.config = config
 
         # agent context
-        self.context = context or AgentContext(config)
+        self.context = context or AgentContext(config=config, agent0=self)
 
         # non-config vars
         self.number = number
-        self.agent_name = f"Agent {self.number}"
+        self.agent_name = f"A{self.number}"
 
         self.history = history.History(self)
         self.last_user_message: history.Message | None = None
         self.intervention: UserMessage | None = None
         self.data = {}  # free data object all the tools can use
+
+
+        asyncio.run(self.call_extensions("agent_init"))
+
+
+
 
     async def monologue(self):
         while True:
@@ -281,34 +313,39 @@ class Agent:
 
                     self.context.streaming_agent = self  # mark self as current streamer
                     self.loop_data.iteration += 1
+                    self.loop_data.params_temporary = {}  # clear temporary params
 
                     # call message_loop_start extensions
-                    await self.call_extensions("message_loop_start", loop_data=self.loop_data)
+                    await self.call_extensions(
+                        "message_loop_start", loop_data=self.loop_data
+                    )
 
                     try:
                         # prepare LLM chain (model, system, history)
                         prompt = await self.prepare_prompt(loop_data=self.loop_data)
 
-                        # output that the agent is starting
-                        PrintStyle(
-                            bold=True,
-                            font_color="green",
-                            padding=True,
-                            background_color="white",
-                        ).print(f"{self.agent_name}: Generating")
-                        log = self.context.log.log(
-                            type="agent", heading=f"{self.agent_name}: Generating"
-                        )
+                        # call before_main_llm_call extensions
+                        await self.call_extensions("before_main_llm_call", loop_data=self.loop_data)
+
+                        async def reasoning_callback(chunk: str, full: str):
+                            if chunk == full:
+                                printer.print("Reasoning: ")  # start of reasoning
+                            printer.stream(chunk)
+                            await self.handle_reasoning_stream(full)
 
                         async def stream_callback(chunk: str, full: str):
                             # output the agent response stream
-                            if chunk:
-                                printer.stream(chunk)
-                                self.log_from_stream(full, log)
+                            if chunk == full:
+                                printer.print("Response: ")  # start of response
+                            printer.stream(chunk)
+                            await self.handle_response_stream(full)
 
-                        agent_response = await self.call_chat_model(
-                            prompt, callback=stream_callback
-                        )  # type: ignore
+                        # call main LLM
+                        agent_response, _reasoning = await self.call_chat_model(
+                            messages=prompt,
+                            response_callback=stream_callback,
+                            reasoning_callback=reasoning_callback,
+                        )
 
                         await self.handle_intervention(agent_response)
 
@@ -362,7 +399,9 @@ class Agent:
                 # call monologue_end extensions
                 await self.call_extensions("monologue_end", loop_data=self.loop_data)  # type: ignore
 
-    async def prepare_prompt(self, loop_data: LoopData) -> ChatPromptTemplate:
+    async def prepare_prompt(self, loop_data: LoopData) -> list[BaseMessage]:
+        self.context.log.set_progress("Building prompt")
+
         # call extensions before setting prompts
         await self.call_extensions("message_loop_prompts_before", loop_data=loop_data)
 
@@ -373,17 +412,19 @@ class Agent:
         # and allow extensions to edit them
         await self.call_extensions("message_loop_prompts_after", loop_data=loop_data)
 
-        # extras (memory etc.)
-        # extras: list[history.OutputMessage] = []
-        # for extra in loop_data.extras_persistent.values():
-        #     extras += history.Message(False, content=extra).output()
-        # for extra in loop_data.extras_temporary.values():
-        #     extras += history.Message(False, content=extra).output()
+        # concatenate system prompt
+        system_text = "\n\n".join(loop_data.system)
+
+        # join extras
         extras = history.Message(
-            False, 
-            content=self.read_prompt("agent.context.extras.md", extras=dirty_json.stringify(
-                {**loop_data.extras_persistent, **loop_data.extras_temporary}
-                ))).output()
+            False,
+            content=self.read_prompt(
+                "agent.context.extras.md",
+                extras=dirty_json.stringify(
+                    {**loop_data.extras_persistent, **loop_data.extras_temporary}
+                ),
+            ),
+        ).output()
         loop_data.extras_temporary.clear()
 
         # convert history + extras to LLM format
@@ -391,28 +432,23 @@ class Agent:
             loop_data.history_output + extras
         )
 
-        # build chain from system prompt, message history and model
-        system_text = "\n\n".join(loop_data.system)
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                SystemMessage(content=system_text),
-                *history_langchain,
-                # AIMessage(content="JSON:"), # force the LLM to start with json
-            ]
-        )
+        # build full prompt from system prompt, message history and extrS
+        full_prompt: list[BaseMessage] = [
+            SystemMessage(content=system_text),
+            *history_langchain,
+        ]
+        full_text = ChatPromptTemplate.from_messages(full_prompt).format()
 
         # store as last context window content
         self.set_data(
             Agent.DATA_NAME_CTX_WINDOW,
             {
-                "text": prompt.format(),
-                "tokens": self.history.get_tokens()
-                + tokens.approximate_tokens(system_text)
-                + tokens.approximate_tokens(history.output_text(extras)),
+                "text": full_text,
+                "tokens": tokens.approximate_tokens(full_text),
             },
         )
 
-        return prompt
+        return full_prompt
 
     def handle_critical_exception(self, exception: Exception):
         if isinstance(exception, HandledException):
@@ -446,27 +482,27 @@ class Agent:
         return system_prompt
 
     def parse_prompt(self, file: str, **kwargs):
-        prompt_dir = files.get_abs_path("prompts/default")
+        prompt_dir = files.get_abs_path("prompts")
         backup_dir = []
         if (
-            self.config.prompts_subdir
+            self.config.profile
         ):  # if agent has custom folder, use it and use default as backup
-            prompt_dir = files.get_abs_path("prompts", self.config.prompts_subdir)
-            backup_dir.append(files.get_abs_path("prompts/default"))
+            prompt_dir = files.get_abs_path("agents", self.config.profile, "prompts")
+            backup_dir.append(files.get_abs_path("prompts"))
         prompt = files.parse_file(
             files.get_abs_path(prompt_dir, file), _backup_dirs=backup_dir, **kwargs
         )
         return prompt
 
     def read_prompt(self, file: str, **kwargs) -> str:
-        prompt_dir = files.get_abs_path("prompts/default")
+        prompt_dir = files.get_abs_path("prompts")
         backup_dir = []
         if (
-            self.config.prompts_subdir
+            self.config.profile
         ):  # if agent has custom folder, use it and use default as backup
-            prompt_dir = files.get_abs_path("prompts", self.config.prompts_subdir)
-            backup_dir.append(files.get_abs_path("prompts/default"))
-        prompt = files.read_file(
+            prompt_dir = files.get_abs_path("agents", self.config.profile, "prompts")
+            backup_dir.append(files.get_abs_path("prompts"))
+        prompt = files.read_prompt_file(
             files.get_abs_path(prompt_dir, file), _backup_dirs=backup_dir, **kwargs
         )
         prompt = files.remove_code_fences(prompt)
@@ -481,6 +517,7 @@ class Agent:
     def hist_add_message(
         self, ai: bool, content: history.MessageContent, tokens: int = 0
     ):
+        self.last_message = datetime.now(timezone.utc)
         return self.history.add_message(ai=ai, content=content, tokens=tokens)
 
     def hist_add_user_message(self, message: UserMessage, intervention: bool = False):
@@ -492,14 +529,14 @@ class Agent:
                 "fw.intervention.md",
                 message=message.message,
                 attachments=message.attachments,
-                system_message=message.system_message
+                system_message=message.system_message,
             )
         else:
             content = self.parse_prompt(
                 "fw.user_message.md",
                 message=message.message,
                 attachments=message.attachments,
-                system_message=message.system_message
+                system_message=message.system_message,
             )
 
         # remove empty parts from template
@@ -532,27 +569,35 @@ class Agent:
         return self.history.output_text(human_label="user", ai_label="assistant")
 
     def get_chat_model(self):
-        return models.get_model(
-            models.ModelType.CHAT,
+        return models.get_chat_model(
             self.config.chat_model.provider,
             self.config.chat_model.name,
-            **self.config.chat_model.kwargs,
+            model_config=self.config.chat_model,
+            **self.config.chat_model.build_kwargs(),
         )
 
     def get_utility_model(self):
-        return models.get_model(
-            models.ModelType.CHAT,
+        return models.get_chat_model(
             self.config.utility_model.provider,
             self.config.utility_model.name,
-            **self.config.utility_model.kwargs,
+            model_config=self.config.utility_model,
+            **self.config.utility_model.build_kwargs(),
+        )
+
+    def get_browser_model(self):
+        return models.get_browser_model(
+            self.config.browser_model.provider,
+            self.config.browser_model.name,
+            model_config=self.config.browser_model,
+            **self.config.browser_model.build_kwargs(),
         )
 
     def get_embedding_model(self):
-        return models.get_model(
-            models.ModelType.EMBEDDING,
+        return models.get_embedding_model(
             self.config.embeddings_model.provider,
             self.config.embeddings_model.name,
-            **self.config.embeddings_model.kwargs,
+            model_config=self.config.embeddings_model,
+            **self.config.embeddings_model.build_kwargs(),
         )
 
     async def call_utility_model(
@@ -562,88 +607,51 @@ class Agent:
         callback: Callable[[str], Awaitable[None]] | None = None,
         background: bool = False,
     ):
-        prompt = ChatPromptTemplate.from_messages(
-            [SystemMessage(content=system), HumanMessage(content=message)]
-        )
-
-        response = ""
-
-        # model class
         model = self.get_utility_model()
 
-        # rate limiter
-        limiter = await self.rate_limiter(
-            self.config.utility_model, prompt.format(), background
-        )
 
-        async for chunk in (prompt | model).astream({}):
-            await self.handle_intervention()  # wait for intervention and handle it, if paused
-
-            content = models.parse_chunk(chunk)
-            limiter.add(output=tokens.approximate_tokens(content))
-            response += content
-
+        # propagate stream to callback if set
+        async def stream_callback(chunk: str, total: str):
             if callback:
-                await callback(content)
+                await callback(chunk)
+
+        response, _reasoning = await model.unified_call(
+            system_message=system,
+            user_message=message,
+            response_callback=stream_callback,
+            rate_limiter_callback=self.rate_limiter_callback if not background else None,
+        )
 
         return response
 
     async def call_chat_model(
         self,
-        prompt: ChatPromptTemplate,
-        callback: Callable[[str, str], Awaitable[None]] | None = None,
+        messages: list[BaseMessage],
+        response_callback: Callable[[str, str], Awaitable[None]] | None = None,
+        reasoning_callback: Callable[[str, str], Awaitable[None]] | None = None,
+        background: bool = False,
     ):
         response = ""
 
         # model class
         model = self.get_chat_model()
 
-        # rate limiter
-        limiter = await self.rate_limiter(self.config.chat_model, prompt.format())
-
-        async for chunk in (prompt | model).astream({}):
-            await self.handle_intervention()  # wait for intervention and handle it, if paused
-
-            content = models.parse_chunk(chunk)
-            limiter.add(output=tokens.approximate_tokens(content))
-            response += content
-
-            if callback:
-                await callback(content, response)
-
-        return response
-
-    async def rate_limiter(
-        self, model_config: ModelConfig, input: str, background: bool = False
-    ):
-        # rate limiter log
-        wait_log = None
-
-        async def wait_callback(msg: str, key: str, total: int, limit: int):
-            nonlocal wait_log
-            if not wait_log:
-                wait_log = self.context.log.log(
-                    type="util",
-                    update_progress="none",
-                    heading=msg,
-                    model=f"{model_config.provider.value}\\{model_config.name}",
-                )
-            wait_log.update(heading=msg, key=key, value=total, limit=limit)
-            if not background:
-                self.context.log.set_progress(msg, -1)
-
-        # rate limiter
-        limiter = models.get_rate_limiter(
-            model_config.provider,
-            model_config.name,
-            model_config.limit_requests,
-            model_config.limit_input,
-            model_config.limit_output,
+        # call model
+        response, reasoning = await model.unified_call(
+            messages=messages,
+            reasoning_callback=reasoning_callback,
+            response_callback=response_callback,
+            rate_limiter_callback=self.rate_limiter_callback if not background else None,
         )
-        limiter.add(input=tokens.approximate_tokens(input))
-        limiter.add(requests=1)
-        await limiter.wait(callback=wait_callback)
-        return limiter
+
+        return response, reasoning
+
+    async def rate_limiter_callback(
+        self, message:str, key:str, total:int, limit:int
+    ):
+        # show the rate limit waiting in a progress bar, no need to spam the chat history
+        self.context.log.set_progress(message, True)
+        return False
 
     async def handle_intervention(self, progress: str = ""):
         while self.context.paused:
@@ -668,58 +676,122 @@ class Agent:
         tool_request = extract_tools.json_parse_dirty(msg)
 
         if tool_request is not None:
-            tool_name = tool_request.get("tool_name", "")
-            tool_method = None
+            raw_tool_name = tool_request.get("tool_name", "")  # Get the raw tool name
             tool_args = tool_request.get("tool_args", {})
 
-            if ":" in tool_name:
-                tool_name, tool_method = tool_name.split(":", 1)
+            tool_name = raw_tool_name  # Initialize tool_name with raw_tool_name
+            tool_method = None  # Initialize tool_method
 
-            tool = self.get_tool(name=tool_name, method=tool_method, args=tool_args, message=msg)
+            # Split raw_tool_name into tool_name and tool_method if applicable
+            if ":" in raw_tool_name:
+                tool_name, tool_method = raw_tool_name.split(":", 1)
 
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            await tool.before_execution(**tool_args)
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            response = await tool.execute(**tool_args)
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            await tool.after_execution(response)
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            if response.break_loop:
-                return response.message
+            tool = None  # Initialize tool to None
+
+            # Try getting tool from MCP first
+            try:
+                import python.helpers.mcp_handler as mcp_helper
+
+                mcp_tool_candidate = mcp_helper.MCPConfig.get_instance().get_tool(
+                    self, tool_name
+                )
+                if mcp_tool_candidate:
+                    tool = mcp_tool_candidate
+            except ImportError:
+                PrintStyle(
+                    background_color="black", font_color="yellow", padding=True
+                ).print("MCP helper module not found. Skipping MCP tool lookup.")
+            except Exception as e:
+                PrintStyle(
+                    background_color="black", font_color="red", padding=True
+                ).print(f"Failed to get MCP tool '{tool_name}': {e}")
+
+            # Fallback to local get_tool if MCP tool was not found or MCP lookup failed
+            if not tool:
+                tool = self.get_tool(
+                    name=tool_name, method=tool_method, args=tool_args, message=msg, loop_data=self.loop_data
+                )
+
+            if tool:
+                await self.handle_intervention()
+                await tool.before_execution(**tool_args)
+                await self.handle_intervention()
+                response = await tool.execute(**tool_args)
+                await self.handle_intervention()
+                await tool.after_execution(response)
+                await self.handle_intervention()
+                if response.break_loop:
+                    return response.message
+            else:
+                error_detail = (
+                    f"Tool '{raw_tool_name}' not found or could not be initialized."
+                )
+                self.hist_add_warning(error_detail)
+                PrintStyle(font_color="red", padding=True).print(error_detail)
+                self.context.log.log(
+                    type="error", content=f"{self.agent_name}: {error_detail}"
+                )
         else:
-            msg = self.read_prompt("fw.msg_misformat.md")
-            self.hist_add_warning(msg)
-            PrintStyle(font_color="red", padding=True).print(msg)
+            warning_msg_misformat = self.read_prompt("fw.msg_misformat.md")
+            self.hist_add_warning(warning_msg_misformat)
+            PrintStyle(font_color="red", padding=True).print(warning_msg_misformat)
             self.context.log.log(
-                type="error", content=f"{self.agent_name}: Message misformat"
+                type="error",
+                content=f"{self.agent_name}: Message misformat, no valid tool request found.",
             )
 
-    def log_from_stream(self, stream: str, logItem: Log.LogItem):
+    async def handle_reasoning_stream(self, stream: str):
+        await self.call_extensions(
+            "reasoning_stream",
+            loop_data=self.loop_data,
+            text=stream,
+        )
+
+    async def handle_response_stream(self, stream: str):
         try:
             if len(stream) < 25:
                 return  # no reason to try
             response = DirtyJson.parse_string(stream)
             if isinstance(response, dict):
-                # log if result is a dictionary already
-                logItem.update(content=stream, kvps=response)
+                await self.call_extensions(
+                    "response_stream",
+                    loop_data=self.loop_data,
+                    text=stream,
+                    parsed=response,
+                )
+
         except Exception as e:
             pass
 
-    def get_tool(self, name: str, method: str | None, args: dict, message: str, **kwargs):
+    def get_tool(
+        self, name: str, method: str | None, args: dict, message: str, loop_data: LoopData | None, **kwargs
+    ):
         from python.tools.unknown import Unknown
         from python.helpers.tool import Tool
 
-        classes = extract_tools.load_classes_from_folder(
-            "python/tools", name + ".py", Tool
-        )
+        classes = []
+
+        # try agent tools first
+        if self.config.profile:
+            try:
+                classes = extract_tools.load_classes_from_file(
+                    "agents/" + self.config.profile + "/tools/" + name + ".py", Tool
+                )
+            except Exception as e:
+                pass
+
+        # try default tools
+        if not classes:
+            try:
+                classes = extract_tools.load_classes_from_file(
+                    "python/tools/" + name + ".py", Tool
+                )
+            except Exception as e:
+                pass
         tool_class = classes[0] if classes else Unknown
-        return tool_class(agent=self, name=name, method=method, args=args, message=message, **kwargs)
-
-    async def call_extensions(self, folder: str, **kwargs) -> Any:
-        from python.helpers.extension import Extension
-
-        classes = extract_tools.load_classes_from_folder(
-            "python/extensions/" + folder, "*", Extension
+        return tool_class(
+            agent=self, name=name, method=method, args=args, message=message, loop_data=loop_data, **kwargs
         )
-        for cls in classes:
-            await cls(agent=self).execute(**kwargs)
+
+    async def call_extensions(self, extension_point: str, **kwargs) -> Any:
+        return await call_extensions(extension_point=extension_point, agent=self, **kwargs)

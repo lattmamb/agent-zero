@@ -1,5 +1,6 @@
 from agent import Agent, UserMessage
 from python.helpers.tool import Tool, Response
+from initialize import initialize_agent
 
 
 class Delegation(Tool):
@@ -10,16 +11,36 @@ class Delegation(Tool):
             self.agent.get_data(Agent.DATA_NAME_SUBORDINATE) is None
             or str(reset).lower().strip() == "true"
         ):
-            sub = Agent(
-                self.agent.number + 1, self.agent.config, self.agent.context
-            )
+            # initialize default config
+            config = initialize_agent()
+
+            # set subordinate prompt profile if provided, if not, keep original
+            agent_profile = kwargs.get("profile")
+            if agent_profile:
+                config.profile = agent_profile
+
+            # crate agent
+            sub = Agent(self.agent.number + 1, config, self.agent.context)
+            # register superior/subordinate
             sub.set_data(Agent.DATA_NAME_SUPERIOR, self.agent)
             self.agent.set_data(Agent.DATA_NAME_SUBORDINATE, sub)
 
         # add user message to subordinate agent
-        subordinate: Agent = self.agent.get_data(Agent.DATA_NAME_SUBORDINATE)
+        subordinate: Agent = self.agent.get_data(Agent.DATA_NAME_SUBORDINATE) # type: ignore
         subordinate.hist_add_user_message(UserMessage(message=message, attachments=[]))
+
+
+
         # run subordinate monologue
         result = await subordinate.monologue()
+
         # result
         return Response(message=result, break_loop=False)
+
+    def get_log_object(self):
+        return self.agent.context.log.log(
+            type="tool",
+            heading=f"icon://communication {self.agent.agent_name}: Calling Subordinate Agent",
+            content="",
+            kvps=self.args,
+        )

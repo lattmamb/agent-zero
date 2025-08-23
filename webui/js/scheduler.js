@@ -59,11 +59,27 @@ import { switchFromContext } from '../index.js';
 
 // Add this near the top of the scheduler.js file, outside of any function
 const showToast = function(message, type = 'info') {
-    // Use the global toast function if available, otherwise fallback to console
-    if (typeof window.toast === 'function') {
-        window.toast(message, type);
+    // Use new frontend notification system
+    if (window.Alpine && window.Alpine.store && window.Alpine.store('notificationStore')) {
+        const store = window.Alpine.store('notificationStore');
+        switch (type.toLowerCase()) {
+            case 'error':
+                return store.frontendError(message, "Scheduler", 5);
+            case 'success':
+                return store.frontendInfo(message, "Scheduler", 3);
+            case 'warning':
+                return store.frontendWarning(message, "Scheduler", 4);
+            case 'info':
+            default:
+                return store.frontendInfo(message, "Scheduler", 3);
+        }
     } else {
-        console.log(`Toast (${type}): ${message}`);
+        // Fallback to global toast function or console
+        if (typeof window.toast === 'function') {
+            window.toast(message, type);
+        } else {
+            console.log(`SCHEDULER ${type.toUpperCase()}: ${message}`);
+        }
     }
 };
 
@@ -256,7 +272,7 @@ const fullComponentImplementation = function() {
 
             this.isLoading = true;
             try {
-                const response = await fetch('/scheduler_tasks_list', {
+                const response = await fetchApi('/scheduler_tasks_list', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -784,7 +800,7 @@ const fullComponentImplementation = function() {
                 console.log('Final task data being sent to API:', JSON.stringify(taskData, null, 2));
 
                 // Make API request
-                const response = await fetch(apiEndpoint, {
+                const response = await fetchApi(apiEndpoint, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -874,7 +890,7 @@ const fullComponentImplementation = function() {
         // Run a task
         async runTask(taskId) {
             try {
-                const response = await fetch('/scheduler_task_run', {
+                const response = await fetchApi('/scheduler_task_run', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -918,7 +934,7 @@ const fullComponentImplementation = function() {
                 this.showLoadingState = true;
 
                 // Call API to update the task state
-                const response = await fetch('/scheduler_task_update', {
+                const response = await fetchApi('/scheduler_task_update', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -959,7 +975,7 @@ const fullComponentImplementation = function() {
                 // if we delete selected context, switch to another first
                 switchFromContext(taskId);
 
-                const response = await fetch('/scheduler_task_delete', {
+                const response = await fetchApi('/scheduler_task_delete', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -976,7 +992,7 @@ const fullComponentImplementation = function() {
                 }
 
                 showToast('Task deleted successfully', 'success');
-                
+
                 // If we were viewing the detail of the deleted task, close the detail view
                 if (this.selectedTaskForDetail && this.selectedTaskForDetail.uuid === taskId) {
                     this.closeTaskDetail();
