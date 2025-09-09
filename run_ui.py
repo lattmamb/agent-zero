@@ -16,6 +16,10 @@ from python.helpers.extract_tools import load_classes_from_folder
 from python.helpers.api import ApiHandler
 from python.helpers.print_style import PrintStyle
 
+# disable logging
+import logging
+logging.getLogger().setLevel(logging.WARNING)
+
 
 # Set the new timezone to 'UTC'
 os.environ["TZ"] = "UTC"

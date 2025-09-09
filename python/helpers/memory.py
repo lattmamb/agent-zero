@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any, List, Sequence
 from langchain.storage import InMemoryByteStore, LocalFileStore
 from langchain.embeddings import CacheBackedEmbeddings
+from python.helpers import guids
 
 # from langchain_chroma import Chroma
 from langchain_community.vectorstores import FAISS
@@ -24,7 +25,6 @@ import numpy as np
 from python.helpers.print_style import PrintStyle
 from . import files
 from langchain_core.documents import Document
-import uuid
 from python.helpers import knowledge_import
 from python.helpers.log import Log, LogItem
 from enum import Enum
@@ -361,7 +361,7 @@ class Memory:
         return ids[0]
 
     async def insert_documents(self, docs: list[Document]):
-        ids = [str(uuid.uuid4()) for _ in range(len(docs))]
+        ids = [self._generate_doc_id() for _ in range(len(docs))]
         timestamp = self.get_timestamp()
 
         if ids:
@@ -377,6 +377,13 @@ class Memory:
 
     def _save_db(self):
         Memory._save_db_file(self.db, self.memory_subdir)
+
+    def _generate_doc_id(self):
+        while True:
+            doc_id = guids.generate_id(10) # random ID
+            if not self.db.get_by_ids(doc_id): # check if exists
+                return doc_id
+            
 
     @staticmethod
     def _save_db_file(db: MyFaiss, memory_subdir: str):

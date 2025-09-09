@@ -18,6 +18,7 @@ from litellm import completion, acompletion, embedding
 import litellm
 
 from python.helpers import dotenv
+from python.helpers import settings
 from python.helpers.dotenv import load_dotenv
 from python.helpers.providers import get_provider_config
 from python.helpers.rate_limiter import RateLimiter
@@ -52,6 +53,7 @@ def turn_off_logging():
 # init
 load_dotenv()
 turn_off_logging()
+litellm.modify_params = True  # helps fix anthropic tool calls by browser-use
 
 
 class ModelType(Enum):
@@ -81,13 +83,115 @@ class ModelConfig:
 
 class ChatChunk(TypedDict):
     """Simplified response chunk for chat models."""
-
     response_delta: str
     reasoning_delta: str
 
+class ChatGenerationResult:
+    """Chat generation result object"""
+    def __init__(self, chunk: ChatChunk|None = None):
+        self.reasoning = ""
+        self.response = ""
+        self.thinking = False
+        self.thinking_tag = ""
+        self.unprocessed = ""
+        self.native_reasoning = False
+        self.thinking_pairs = [("<think>", "</think>"), ("<reasoning>", "</reasoning>")]
+        if chunk:
+            self.add_chunk(chunk)
+
+    def add_chunk(self, chunk: ChatChunk) -> ChatChunk:
+        if chunk["reasoning_delta"]:
+            self.native_reasoning = True
+        
+        # if native reasoning detection works, there's no need to worry about thinking tags
+        if self.native_reasoning:
+            processed_chunk = ChatChunk(response_delta=chunk["response_delta"], reasoning_delta=chunk["reasoning_delta"])
+        else:
+            # if the model outputs thinking tags, we ned to parse them manually as reasoning
+            processed_chunk = self._process_thinking_chunk(chunk)
+        
+        self.reasoning += processed_chunk["reasoning_delta"]
+        self.response += processed_chunk["response_delta"]
+        
+        return processed_chunk
+
+    def _process_thinking_chunk(self, chunk: ChatChunk) -> ChatChunk:
+        response_delta = self.unprocessed + chunk["response_delta"]
+        self.unprocessed = ""
+        return self._process_thinking_tags(response_delta, chunk["reasoning_delta"])
+
+    def _process_thinking_tags(self, response: str, reasoning: str) -> ChatChunk:
+        if self.thinking:
+            close_pos = response.find(self.thinking_tag)
+            if close_pos != -1:
+                reasoning += response[:close_pos]
+                response = response[close_pos + len(self.thinking_tag):]
+                self.thinking = False
+                self.thinking_tag = ""
+            else:
+                if self._is_partial_closing_tag(response):
+                    self.unprocessed = response
+                    response = ""
+                else:
+                    reasoning += response
+                    response = ""
+        else:
+            for opening_tag, closing_tag in self.thinking_pairs:
+                if response.startswith(opening_tag):
+                    response = response[len(opening_tag):]
+                    self.thinking = True
+                    self.thinking_tag = closing_tag
+                    
+                    close_pos = response.find(closing_tag)
+                    if close_pos != -1:
+                        reasoning += response[:close_pos]
+                        response = response[close_pos + len(closing_tag):]
+                        self.thinking = False
+                        self.thinking_tag = ""
+                    else:
+                        if self._is_partial_closing_tag(response):
+                            self.unprocessed = response
+                            response = ""
+                        else:
+                            reasoning += response
+                            response = ""
+                    break
+                elif len(response) < len(opening_tag) and self._is_partial_opening_tag(response, opening_tag):
+                    self.unprocessed = response
+                    response = ""
+                    break
+        
+        return ChatChunk(response_delta=response, reasoning_delta=reasoning)
+
+    def _is_partial_opening_tag(self, text: str, opening_tag: str) -> bool:
+        for i in range(1, len(opening_tag)):
+            if text == opening_tag[:i]:
+                return True
+        return False
+
+    def _is_partial_closing_tag(self, text: str) -> bool:
+        if not self.thinking_tag or not text:
+            return False
+        max_check = min(len(text), len(self.thinking_tag) - 1)
+        for i in range(1, max_check + 1):
+            if text.endswith(self.thinking_tag[:i]):
+                return True
+        return False
+
+    def output(self) -> ChatChunk:
+        response = self.response
+        reasoning = self.reasoning
+        if self.unprocessed:
+            if reasoning and not response:
+                reasoning += self.unprocessed
+            else:
+                response += self.unprocessed
+        return ChatChunk(response_delta=response, reasoning_delta=reasoning)
+        
 
 rate_limiters: dict[str, RateLimiter] = {}
 api_keys_round_robin: dict[str, int] = {}
+
 
 def get_api_key(service: str) -> str:
     # get api key for the service
@@ -115,7 +219,14 @@ def get_rate_limiter(
     limiter.limits["output"] = output or 0
     return limiter
 
-async def apply_rate_limiter(model_config: ModelConfig|None, input_text: str, rate_limiter_callback: Callable[[str, str, int, int], Awaitable[bool]] | None = None):
+
+async def apply_rate_limiter(
+    model_config: ModelConfig | None,
+    input_text: str,
+    rate_limiter_callback: (
+        Callable[[str, str, int, int], Awaitable[bool]] | None
+    ) = None,
+):
     if not model_config:
         return
     limiter = get_rate_limiter(
@@ -130,25 +241,41 @@ async def apply_rate_limiter(model_config: ModelConfig|None, input_text: str, ra
     await limiter.wait(rate_limiter_callback)
     return limiter
 
-def apply_rate_limiter_sync(model_config: ModelConfig|None, input_text: str, rate_limiter_callback: Callable[[str, str, int, int], Awaitable[bool]] | None = None):
+
+def apply_rate_limiter_sync(
+    model_config: ModelConfig | None,
+    input_text: str,
+    rate_limiter_callback: (
+        Callable[[str, str, int, int], Awaitable[bool]] | None
+    ) = None,
+):
     if not model_config:
         return
     import asyncio, nest_asyncio
+
     nest_asyncio.apply()
-    return asyncio.run(apply_rate_limiter(model_config, input_text, rate_limiter_callback))
+    return asyncio.run(
+        apply_rate_limiter(model_config, input_text, rate_limiter_callback)
+    )
 
 
 class LiteLLMChatWrapper(SimpleChatModel):
     model_name: str
     provider: str
     kwargs: dict = {}
-    
+
     class Config:
         arbitrary_types_allowed = True
         extra = "allow"  # Allow extra attributes
         validate_assignment = False  # Don't validate on assignment
 
-    def __init__(self, model: str, provider: str, model_config: Optional[ModelConfig] = None, **kwargs: Any):
+    def __init__(
+        self,
+        model: str,
+        provider: str,
+        model_config: Optional[ModelConfig] = None,
+        **kwargs: Any,
+    ):
         model_value = f"{provider}/{model}"
         super().__init__(model_name=model_value, provider=provider, kwargs=kwargs)  # type: ignore
         # Set A0 model config as instance attribute after parent init
@@ -157,7 +284,7 @@ class LiteLLMChatWrapper(SimpleChatModel):
     @property
     def _llm_type(self) -> str:
         return "litellm-chat"
-    
+
     def _convert_messages(self, messages: List[BaseMessage]) -> List[dict]:
         result = []
         # Map LangChain message types to LiteLLM roles
@@ -214,12 +341,12 @@ class LiteLLMChatWrapper(SimpleChatModel):
         **kwargs: Any,
     ) -> str:
         import asyncio
-        
+
         msgs = self._convert_messages(messages)
-        
+
         # Apply rate limiting if configured
         apply_rate_limiter_sync(self.a0_model_conf, str(msgs))
-        
+
         # Call the model
         resp = completion(
             model=self.model_name, messages=msgs, stop=stop, **{**self.kwargs, **kwargs}
@@ -227,7 +354,8 @@ class LiteLLMChatWrapper(SimpleChatModel):
 
         # Parse output
         parsed = _parse_chunk(resp)
-        return parsed["response_delta"]
+        output = ChatGenerationResult(parsed).output()
+        return output["response_delta"]
 
     def _stream(
         self,
@@ -237,12 +365,14 @@ class LiteLLMChatWrapper(SimpleChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         import asyncio
-        
+
         msgs = self._convert_messages(messages)
-        
+
         # Apply rate limiting if configured
         apply_rate_limiter_sync(self.a0_model_conf, str(msgs))
-        
+
+        result = ChatGenerationResult()
+
         for chunk in completion(
             model=self.model_name,
             messages=msgs,
@@ -250,11 +380,14 @@ class LiteLLMChatWrapper(SimpleChatModel):
             stop=stop,
             **{**self.kwargs, **kwargs},
         ):
-            parsed = _parse_chunk(chunk)
+            # parse chunk
+            parsed = _parse_chunk(chunk) # chunk parsing
+            output = result.add_chunk(parsed) # chunk processing
+
             # Only yield chunks with non-None content
-            if parsed["response_delta"]:
+            if output["response_delta"]:
                 yield ChatGenerationChunk(
-                    message=AIMessageChunk(content=parsed["response_delta"])
+                    message=AIMessageChunk(content=output["response_delta"])
                 )
 
     async def _astream(
@@ -265,11 +398,12 @@ class LiteLLMChatWrapper(SimpleChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         msgs = self._convert_messages(messages)
-        
+
         # Apply rate limiting if configured
         await apply_rate_limiter(self.a0_model_conf, str(msgs))
-        
-        
+
+        result = ChatGenerationResult()
+
         response = await acompletion(
             model=self.model_name,
             messages=msgs,
@@ -278,11 +412,14 @@ class LiteLLMChatWrapper(SimpleChatModel):
             **{**self.kwargs, **kwargs},
         )
         async for chunk in response:  # type: ignore
-            parsed = _parse_chunk(chunk)
+            # parse chunk
+            parsed = _parse_chunk(chunk) # chunk parsing
+            output = result.add_chunk(parsed) # chunk processing
+
             # Only yield chunks with non-None content
-            if parsed["response_delta"]:
+            if output["response_delta"]:
                 yield ChatGenerationChunk(
-                    message=AIMessageChunk(content=parsed["response_delta"])
+                    message=AIMessageChunk(content=output["response_delta"])
                 )
 
     async def unified_call(
@@ -293,7 +430,9 @@ class LiteLLMChatWrapper(SimpleChatModel):
         response_callback: Callable[[str, str], Awaitable[None]] | None = None,
         reasoning_callback: Callable[[str, str], Awaitable[None]] | None = None,
         tokens_callback: Callable[[str, int], Awaitable[None]] | None = None,
-        rate_limiter_callback: Callable[[str, str, int, int], Awaitable[bool]] | None = None,
+        rate_limiter_callback: (
+            Callable[[str, str, int, int], Awaitable[bool]] | None
+        ) = None,
         **kwargs: Any,
     ) -> Tuple[str, str]:
 
@@ -311,7 +450,9 @@ class LiteLLMChatWrapper(SimpleChatModel):
         msgs_conv = self._convert_messages(messages)
 
         # Apply rate limiting if configured
-        limiter = await apply_rate_limiter(self.a0_model_conf, str(msgs_conv), rate_limiter_callback)
+        limiter = await apply_rate_limiter(
+            self.a0_model_conf, str(msgs_conv), rate_limiter_callback
+        )
 
         # call model
         _completion = await acompletion(
@@ -322,41 +463,41 @@ class LiteLLMChatWrapper(SimpleChatModel):
         )
 
         # results
-        reasoning = ""
-        response = ""
+        result = ChatGenerationResult()
 
         # iterate over chunks
         async for chunk in _completion:  # type: ignore
+            # parse chunk
             parsed = _parse_chunk(chunk)
+            output = result.add_chunk(parsed)
+
             # collect reasoning delta and call callbacks
-            if parsed["reasoning_delta"]:
-                reasoning += parsed["reasoning_delta"]
+            if output["reasoning_delta"]:
                 if reasoning_callback:
-                    await reasoning_callback(parsed["reasoning_delta"], reasoning)
+                    await reasoning_callback(output["reasoning_delta"], result.reasoning)
                 if tokens_callback:
                     await tokens_callback(
-                        parsed["reasoning_delta"],
-                        approximate_tokens(parsed["reasoning_delta"]),
+                        output["reasoning_delta"],
+                        approximate_tokens(output["reasoning_delta"]),
                     )
                 # Add output tokens to rate limiter if configured
                 if limiter:
-                    limiter.add(output=approximate_tokens(parsed["reasoning_delta"]))
+                    limiter.add(output=approximate_tokens(output["reasoning_delta"]))
             # collect response delta and call callbacks
-            if parsed["response_delta"]:
-                response += parsed["response_delta"]
+            if output["response_delta"]:
                 if response_callback:
-                    await response_callback(parsed["response_delta"], response)
+                    await response_callback(output["response_delta"], result.response)
                 if tokens_callback:
                     await tokens_callback(
-                        parsed["response_delta"],
-                        approximate_tokens(parsed["response_delta"]),
+                        output["response_delta"],
+                        approximate_tokens(output["response_delta"]),
                     )
                 # Add output tokens to rate limiter if configured
                 if limiter:
-                    limiter.add(output=approximate_tokens(parsed["response_delta"]))
+                    limiter.add(output=approximate_tokens(output["response_delta"]))
 
         # return complete results
-        return response, reasoning
+        return result.response, result.reasoning
 
 
 class BrowserCompatibleChatWrapper(LiteLLMChatWrapper):
@@ -399,15 +540,21 @@ class LiteLLMEmbeddingWrapper(Embeddings):
     kwargs: dict = {}
     a0_model_conf: Optional[ModelConfig] = None
 
-    def __init__(self, model: str, provider: str, model_config: Optional[ModelConfig] = None, **kwargs: Any):
+    def __init__(
+        self,
+        model: str,
+        provider: str,
+        model_config: Optional[ModelConfig] = None,
+        **kwargs: Any,
+    ):
         self.model_name = f"{provider}/{model}" if provider != "openai" else model
         self.kwargs = kwargs
         self.a0_model_conf = model_config
-    
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         # Apply rate limiting if configured
         apply_rate_limiter_sync(self.a0_model_conf, " ".join(texts))
-        
+
         resp = embedding(model=self.model_name, input=texts, **self.kwargs)
         return [
             item.get("embedding") if isinstance(item, dict) else item.embedding  # type: ignore
@@ -417,7 +564,7 @@ class LiteLLMEmbeddingWrapper(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         # Apply rate limiting if configured
         apply_rate_limiter_sync(self.a0_model_conf, text)
-        
+
         resp = embedding(model=self.model_name, input=[text], **self.kwargs)
         item = resp.data[0]  # type: ignore
         return item.get("embedding") if isinstance(item, dict) else item.embedding  # type: ignore
@@ -426,7 +573,13 @@ class LiteLLMEmbeddingWrapper(Embeddings):
 class LocalSentenceTransformerWrapper(Embeddings):
     """Local wrapper for sentence-transformers models to avoid HuggingFace API calls"""
 
-    def __init__(self, provider: str, model: str, model_config: Optional[ModelConfig] = None, **kwargs: Any):
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        model_config: Optional[ModelConfig] = None,
+        **kwargs: Any,
+    ):
         # Clean common user-input mistakes
         model = model.strip().strip('"').strip("'")
 
@@ -434,21 +587,32 @@ class LocalSentenceTransformerWrapper(Embeddings):
         if model.startswith("sentence-transformers/"):
             model = model[len("sentence-transformers/") :]
 
-        self.model = SentenceTransformer(model, **kwargs)
+        # Filter kwargs for SentenceTransformer only (no LiteLLM params like 'stream_timeout')
+        st_allowed_keys = {
+            "device",
+            "cache_folder",
+            "use_auth_token",
+            "revision",
+            "trust_remote_code",
+            "model_kwargs",
+        }
+        st_kwargs = {k: v for k, v in (kwargs or {}).items() if k in st_allowed_keys}
+
+        self.model = SentenceTransformer(model, **st_kwargs)
         self.model_name = model
         self.a0_model_conf = model_config
-    
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         # Apply rate limiting if configured
         apply_rate_limiter_sync(self.a0_model_conf, " ".join(texts))
-        
+
         embeddings = self.model.encode(texts, convert_to_tensor=False)  # type: ignore
         return embeddings.tolist() if hasattr(embeddings, "tolist") else embeddings  # type: ignore
 
     def embed_query(self, text: str) -> List[float]:
         # Apply rate limiting if configured
         apply_rate_limiter_sync(self.a0_model_conf, text)
-        
+
         embedding = self.model.encode([text], convert_to_tensor=False)  # type: ignore
         result = (
             embedding[0].tolist() if hasattr(embedding[0], "tolist") else embedding[0]
@@ -473,10 +637,17 @@ def _get_litellm_chat(
     provider_name, model_name, kwargs = _adjust_call_args(
         provider_name, model_name, kwargs
     )
-    return cls(provider=provider_name, model=model_name, model_config=model_config, **kwargs)
+    return cls(
+        provider=provider_name, model=model_name, model_config=model_config, **kwargs
+    )
 
 
-def _get_litellm_embedding(model_name: str, provider_name: str, model_config: Optional[ModelConfig] = None, **kwargs: Any):
+def _get_litellm_embedding(
+    model_name: str,
+    provider_name: str,
+    model_config: Optional[ModelConfig] = None,
+    **kwargs: Any,
+):
     # Check if this is a local sentence-transformers model
     if provider_name == "huggingface" and model_name.startswith(
         "sentence-transformers/"
@@ -486,7 +657,10 @@ def _get_litellm_embedding(model_name: str, provider_name: str, model_config: Op
             provider_name, model_name, kwargs
         )
         return LocalSentenceTransformerWrapper(
-            provider=provider_name, model=model_name, model_config=model_config, **kwargs
+            provider=provider_name,
+            model=model_name,
+            model_config=model_config,
+            **kwargs,
         )
 
     # use api key from kwargs or env
@@ -499,7 +673,9 @@ def _get_litellm_embedding(model_name: str, provider_name: str, model_config: Op
     provider_name, model_name, kwargs = _adjust_call_args(
         provider_name, model_name, kwargs
     )
-    return LiteLLMEmbeddingWrapper(model=model_name, provider=provider_name, model_config=model_config, **kwargs)
+    return LiteLLMEmbeddingWrapper(
+        model=model_name, provider=provider_name, model_config=model_config, **kwargs
+    )
 
 
 def _parse_chunk(chunk: Any) -> ChatChunk:
@@ -521,7 +697,9 @@ def _parse_chunk(chunk: Any) -> ChatChunk:
         if isinstance(delta, dict)
         else getattr(delta, "reasoning_content", "")
     )
+
     return ChatChunk(reasoning_delta=reasoning_delta, response_delta=response_delta)
+
 
 
 def _adjust_call_args(provider_name: str, model_name: str, kwargs: dict):
@@ -542,6 +720,22 @@ def _adjust_call_args(provider_name: str, model_name: str, kwargs: dict):
 def _merge_provider_defaults(
     provider_type: str, original_provider: str, kwargs: dict
 ) -> tuple[str, dict]:
+    # Normalize .env-style numeric strings (e.g., "timeout=30") into ints/floats for LiteLLM
+    def _normalize_values(values: dict) -> dict:
+        result: dict[str, Any] = {}
+        for k, v in values.items():
+            if isinstance(v, str):
+                try:
+                    result[k] = int(v)
+                except ValueError:
+                    try:
+                        result[k] = float(v)
+                    except ValueError:
+                        result[k] = v
+            else:
+                result[k] = v
+        return result
+
     provider_name = original_provider  # default: unchanged
     cfg = get_provider_config(provider_type, original_provider)
     if cfg:
@@ -559,13 +753,26 @@ def _merge_provider_defaults(
         if key and key not in ("None", "NA"):
             kwargs["api_key"] = key
 
+    # Merge LiteLLM global kwargs (timeouts, stream_timeout, etc.)
+    try:
+        global_kwargs = settings.get_settings().get("litellm_global_kwargs", {})  # type: ignore[union-attr]
+    except Exception:
+        global_kwargs = {}
+    if isinstance(global_kwargs, dict):
+        for k, v in _normalize_values(global_kwargs).items():
+            kwargs.setdefault(k, v)
+
     return provider_name, kwargs
 
 
-def get_chat_model(provider: str, name: str, model_config: Optional[ModelConfig] = None, **kwargs: Any) -> LiteLLMChatWrapper:
+def get_chat_model(
+    provider: str, name: str, model_config: Optional[ModelConfig] = None, **kwargs: Any
+) -> LiteLLMChatWrapper:
     orig = provider.lower()
     provider_name, kwargs = _merge_provider_defaults("chat", orig, kwargs)
-    return _get_litellm_chat(LiteLLMChatWrapper, name, provider_name, model_config, **kwargs)
+    return _get_litellm_chat(
+        LiteLLMChatWrapper, name, provider_name, model_config, **kwargs
+    )
 
 
 def get_browser_model(
