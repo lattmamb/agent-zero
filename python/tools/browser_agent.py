@@ -57,7 +57,7 @@ class State:
                 chromium_sandbox=False,
                 accept_downloads=True,
                 downloads_path=files.get_abs_path("tmp/downloads"),
-                allowed_domains=["*"],
+                allowed_domains=["*", "http://*", "https://*"],
                 executable_path=pw_binary,
                 keep_alive=True,
                 minimum_wait_page_load_time=1.0,
@@ -66,6 +66,7 @@ class State:
                 window_size={"width": 1024, "height": 2048},
                 screen={"width": 1024, "height": 2048},
                 viewport={"width": 1024, "height": 2048},
+                no_viewport=False,
                 args=["--headless=new"],
                 # Use a unique user data directory to avoid conflicts
                 user_data_dir=self.get_user_data_dir(),
@@ -76,6 +77,23 @@ class State:
         await self.browser_session.start() if self.browser_session else None
         # self.override_hooks()
 
+        # --------------------------------------------------------------------------
+        # Patch to enforce vertical viewport size
+        # --------------------------------------------------------------------------
+        # Browser-use auto-configuration overrides viewport settings, causing wrong
+        # aspect ratio. We fix this by directly setting viewport size after startup.
+        # --------------------------------------------------------------------------
+
+        if self.browser_session:
+            try:
+                page = await self.browser_session.get_current_page()
+                if page:
+                    await page.set_viewport_size({"width": 1024, "height": 2048})
+            except Exception as e:
+                PrintStyle().warning(f"Could not force set viewport size: {e}")
+
+        # --------------------------------------------------------------------------    
+        
         # Add init script to the browser session
         if self.browser_session and self.browser_session.browser_context:
             js_override = files.get_abs_path("lib/browser/init_override.js")
@@ -148,6 +166,7 @@ class State:
                 ),
                 controller=controller,
                 enable_memory=False,  # Disable memory to avoid state conflicts
+                llm_timeout=3000, # TODO rem
                 sensitive_data=cast(dict[str, str | dict[str, str]] | None, secrets_dict or {}),  # Pass secrets
             )
         except Exception as e:
@@ -387,7 +406,7 @@ class BrowserAgent(Tool):
 def get_use_agent_log(use_agent: browser_use.Agent | None):
     result = ["🚦 Starting task"]
     if use_agent:
-        action_results = use_agent.state.history.action_results() or []
+        action_results = use_agent.history.action_results() or []
         short_log = []
         for item in action_results:
             # final results

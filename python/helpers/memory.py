@@ -76,7 +76,7 @@ class Memory:
                 False,
             )
             Memory.index[memory_subdir] = db
-            wrap = Memory(agent, db, memory_subdir=memory_subdir)
+            wrap = Memory(db, memory_subdir=memory_subdir)
             if agent.config.knowledge_subdirs:
                 await wrap.preload_knowledge(
                     log_item, agent.config.knowledge_subdirs, memory_subdir
@@ -84,10 +84,34 @@ class Memory:
             return wrap
         else:
             return Memory(
-                agent=agent,
                 db=Memory.index[memory_subdir],
                 memory_subdir=memory_subdir,
             )
+
+    @staticmethod
+    async def get_by_subdir(
+        memory_subdir: str,
+        log_item: LogItem | None = None,
+        preload_knowledge: bool = True,
+    ):
+        if not Memory.index.get(memory_subdir):
+            import initialize
+
+            agent_config = initialize.initialize_agent()
+            model_config = agent_config.embeddings_model
+            db, _created = Memory.initialize(
+                log_item=log_item,
+                model_config=model_config,
+                memory_subdir=memory_subdir,
+                in_memory=False,
+            )
+            wrap = Memory(db, memory_subdir=memory_subdir)
+            if preload_knowledge and agent_config.knowledge_subdirs:
+                await wrap.preload_knowledge(
+                    log_item, agent_config.knowledge_subdirs, memory_subdir
+                )
+            Memory.index[memory_subdir] = db
+        return Memory(db=Memory.index[memory_subdir], memory_subdir=memory_subdir)
 
     @staticmethod
     async def reload(agent: Agent):
@@ -212,11 +236,9 @@ class Memory:
 
     def __init__(
         self,
-        agent: Agent,
         db: MyFaiss,
         memory_subdir: str,
     ):
-        self.agent = agent
         self.db = db
         self.memory_subdir = memory_subdir
 
@@ -294,6 +316,9 @@ class Memory:
         )
 
         return index
+
+    def get_document_by_id(self, id: str) -> Document | None:
+        return self.db.get_by_ids(id)[0]
 
     async def search_similarity_threshold(
         self, query: str, limit: int, threshold: float, filter: str = ""
@@ -375,15 +400,21 @@ class Memory:
             self._save_db()  # persist
         return ids
 
+    async def update_documents(self, docs: list[Document]):
+        ids = [doc.metadata["id"] for doc in docs]
+        await self.db.adelete(ids=ids)  # delete originals
+        ins = await self.db.aadd_documents(documents=docs, ids=ids)  # add updated
+        self._save_db()  # persist
+        return ins
+
     def _save_db(self):
         Memory._save_db_file(self.db, self.memory_subdir)
 
     def _generate_doc_id(self):
         while True:
-            doc_id = guids.generate_id(10) # random ID
-            if not self.db.get_by_ids(doc_id): # check if exists
+            doc_id = guids.generate_id(10)  # random ID
+            if not self.db.get_by_ids(doc_id):  # check if exists
                 return doc_id
-            
 
     @staticmethod
     def _save_db_file(db: MyFaiss, memory_subdir: str):
