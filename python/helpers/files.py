@@ -14,15 +14,18 @@ import importlib
 import importlib.util
 import inspect
 import glob
+import mimetypes
 
 
 class VariablesPlugin(ABC):
     @abstractmethod
-    def get_variables(self, file: str, backup_dirs: list[str] | None = None) -> dict[str, Any]:  # type: ignore
+    def get_variables(self, file: str, backup_dirs: list[str] | None = None, **kwargs) -> dict[str, Any]:  # type: ignore
         pass
 
 
-def load_plugin_variables(file: str, backup_dirs: list[str] | None = None) -> dict[str, Any]:
+def load_plugin_variables(
+    file: str, backup_dirs: list[str] | None = None, **kwargs
+) -> dict[str, Any]:
     if not file.endswith(".md"):
         return {}
 
@@ -38,11 +41,14 @@ def load_plugin_variables(file: str, backup_dirs: list[str] | None = None) -> di
         plugin_file = None
 
     if plugin_file and exists(plugin_file):
-        
+
         from python.helpers import extract_tools
-        classes = extract_tools.load_classes_from_file(plugin_file, VariablesPlugin, one_per_file=False)
+
+        classes = extract_tools.load_classes_from_file(
+            plugin_file, VariablesPlugin, one_per_file=False
+        )
         for cls in classes:
-            return cls().get_variables(file, backup_dirs) # type: ignore < abstract class here is ok, it is always a subclass
+            return cls().get_variables(file, backup_dirs, **kwargs)  # type: ignore < abstract class here is ok, it is always a subclass
 
         # load python code and extract variables variables from it
         # module = None
@@ -70,10 +76,13 @@ def load_plugin_variables(file: str, backup_dirs: list[str] | None = None) -> di
         #         return cls[1]().get_variables()  # type: ignore
     return {}
 
+
 from python.helpers.strings import sanitize_string
 
 
-def parse_file(_filename: str, _directories: list[str] | None = None, _encoding="utf-8", **kwargs):
+def parse_file(
+    _filename: str, _directories: list[str] | None = None, _encoding="utf-8", **kwargs
+):
     if _directories is None:
         _directories = []
 
@@ -84,10 +93,10 @@ def parse_file(_filename: str, _directories: list[str] | None = None, _encoding=
     with open(absolute_path, "r", encoding=_encoding) as f:
         # content = remove_code_fences(f.read())
         content = f.read()
-    
+
     is_json = is_full_json_template(content)
     content = remove_code_fences(content)
-    variables = load_plugin_variables(absolute_path, _directories) or {}  # type: ignore
+    variables = load_plugin_variables(absolute_path, _directories, **kwargs) or {}  # type: ignore
     variables.update(kwargs)
     if is_json:
         content = replace_placeholders_json(content, **variables)
@@ -99,12 +108,16 @@ def parse_file(_filename: str, _directories: list[str] | None = None, _encoding=
         # Process include statements
         content = process_includes(
             # here we use kwargs, the plugin variables are not inherited
-            content, _directories, **kwargs
+            content,
+            _directories,
+            **kwargs,
         )
         return content
 
 
-def read_prompt_file(_file: str, _directories: list[str] | None = None, _encoding="utf-8", **kwargs):
+def read_prompt_file(
+    _file: str, _directories: list[str] | None = None, _encoding="utf-8", **kwargs
+):
     if _directories is None:
         _directories = []
 
@@ -122,7 +135,7 @@ def read_prompt_file(_file: str, _directories: list[str] | None = None, _encodin
         # content = remove_code_fences(f.read())
         content = f.read()
 
-    variables = load_plugin_variables(_file, _directories) or {}  # type: ignore
+    variables = load_plugin_variables(_file, _directories, **kwargs) or {}  # type: ignore
     variables.update(kwargs)
 
     # Replace placeholders with values from kwargs
@@ -131,13 +144,15 @@ def read_prompt_file(_file: str, _directories: list[str] | None = None, _encodin
     # Process include statements
     content = process_includes(
         # here we use kwargs, the plugin variables are not inherited
-        content, _directories, **kwargs
+        content,
+        _directories,
+        **kwargs,
     )
 
     return content
 
 
-def read_file(relative_path:str, encoding="utf-8"):
+def read_file(relative_path: str, encoding="utf-8"):
     # Try to get the absolute path for the file from the original directory or backup directories
     absolute_path = get_abs_path(relative_path)
 
@@ -146,7 +161,7 @@ def read_file(relative_path:str, encoding="utf-8"):
         return f.read()
 
 
-def read_file_bin(relative_path:str):
+def read_file_bin(relative_path: str):
     # Try to get the absolute path for the file from the original directory or backup directories
     absolute_path = get_abs_path(relative_path)
 
@@ -248,6 +263,7 @@ def find_file_in_dirs(_filename: str, _directories: list[str]):
         f"File '{_filename}' not found in any of the provided directories."
     )
 
+
 def get_unique_filenames_in_dirs(dir_paths: list[str], pattern: str = "*"):
     # returns absolute paths for unique filenames, priority by order in dir_paths
     seen = set()
@@ -262,6 +278,7 @@ def get_unique_filenames_in_dirs(dir_paths: list[str], pattern: str = "*"):
     # sort by filename (basename), not the full path
     result.sort(key=lambda path: os.path.basename(path))
     return result
+
 
 def remove_code_fences(text):
     # Pattern to match code fences with optional language specifier
@@ -335,6 +352,45 @@ def delete_dir(relative_path: str):
                 pass
 
 
+def move_dir(old_path: str, new_path: str):
+    # rename/move the directory from old_path to new_path (both relative)
+    abs_old = get_abs_path(old_path)
+    abs_new = get_abs_path(new_path)
+    if not os.path.isdir(abs_old):
+        return  # nothing to rename
+    try:
+        os.rename(abs_old, abs_new)
+    except Exception:
+        pass  # suppress all errors, keep behavior consistent
+
+
+# move dir safely, remove with number if needed
+def move_dir_safe(src, dst, rename_format="{name}_{number}"):
+    base_dst = dst
+    i = 2
+    while exists(dst):
+        dst = rename_format.format(name=base_dst, number=i)
+        i += 1
+    move_dir(src, dst)
+    return dst
+
+
+# create dir safely, add number if needed
+def create_dir_safe(dst, rename_format="{name}_{number}"):
+    base_dst = dst
+    i = 2
+    while exists(dst):
+        dst = rename_format.format(name=base_dst, number=i)
+        i += 1
+    create_dir(dst)
+    return dst
+
+
+def create_dir(relative_path: str):
+    abs_path = get_abs_path(relative_path)
+    os.makedirs(abs_path, exist_ok=True)
+
+
 def list_files(relative_path: str, filter: str = "*"):
     abs_path = get_abs_path(relative_path)
     if not os.path.exists(abs_path):
@@ -351,17 +407,29 @@ def get_abs_path(*relative_paths):
     "Convert relative paths to absolute paths based on the base directory."
     return os.path.join(get_base_dir(), *relative_paths)
 
-def deabsolute_path(path:str):
+
+def deabsolute_path(path: str):
     "Convert absolute paths to relative paths based on the base directory."
     return os.path.relpath(path, get_base_dir())
 
-def fix_dev_path(path:str):
+
+def fix_dev_path(path: str):
     "On dev environment, convert /a0/... paths to local absolute paths"
     from python.helpers.runtime import is_development
+
     if is_development():
         if path.startswith("/a0/"):
             path = path.replace("/a0/", "")
     return get_abs_path(path)
+
+
+def normalize_a0_path(path: str):
+    "Convert absolute paths into /a0/... paths"
+    if is_in_base_dir(path):
+        deabs = deabsolute_path(path)
+        return "/a0/" + deabs
+    return path
+
 
 def exists(*relative_paths):
     path = get_abs_path(*relative_paths)
@@ -436,4 +504,43 @@ def move_file(relative_path: str, new_path: str):
 
 def safe_file_name(filename: str) -> str:
     # Replace any character that's not alphanumeric, dash, underscore, or dot with underscore
-    return re.sub(r'[^a-zA-Z0-9-._]', '_', filename)
+    return re.sub(r"[^a-zA-Z0-9-._]", "_", filename)
+
+
+def read_text_files_in_dir(
+    dir_path: str, max_size: int = 1024 * 1024
+) -> dict[str, str]:
+
+    abs_path = get_abs_path(dir_path)
+    if not os.path.exists(abs_path):
+        return {}
+    result = {}
+    for file_path in [os.path.join(abs_path, f) for f in os.listdir(abs_path)]:
+        try:
+            if not os.path.isfile(file_path):
+                continue
+            if os.path.getsize(file_path) > max_size:
+                continue
+            mime, _ = mimetypes.guess_type(file_path)
+            if mime is not None and not mime.startswith("text"):
+                continue
+            # Check if file is binary by reading a small chunk
+            content = read_file(file_path)
+            result[os.path.basename(file_path)] = content
+        except Exception:
+            continue
+    return result
+
+def list_files_in_dir_recursively(relative_path: str) -> list[str]:
+    abs_path = get_abs_path(relative_path)
+    if not os.path.exists(abs_path):
+        return []
+    result = []
+    for root, dirs, files in os.walk(abs_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            # Return relative path from the base directory
+            rel_path = os.path.relpath(file_path, abs_path)
+            result.append(rel_path)
+    return result
+    

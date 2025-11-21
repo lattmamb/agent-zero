@@ -27,6 +27,9 @@ chat:
   anthropic:
     name: Anthropic
     litellm_provider: anthropic
+  cometapi:
+    name: CometAPI
+    litellm_provider: cometapi
   deepseek:
     name: DeepSeek
     litellm_provider: deepseek
@@ -35,8 +38,8 @@ chat:
     litellm_provider: github_copilot
     kwargs:
       extra_headers:
-          "Editor-Version": "vscode/1.85.1"
-          "Copilot-Integration-Id": "vscode-chat"
+        "Editor-Version": "vscode/1.85.1"
+        "Copilot-Integration-Id": "vscode-chat"
   google:
     name: Google
     litellm_provider: gemini
@@ -107,6 +110,15 @@ embedding:
   azure:
     name: OpenAI Azure
     litellm_provider: azure
+  # TODO: OpenRouter not yet supported by LiteLLM, replace with native litellm_provider openrouter and remove api_base when ready
+  openrouter:
+    name: OpenRouter
+    litellm_provider: openai
+    kwargs:
+      api_base: https://openrouter.ai/api/v1
+      extra_headers:
+        "HTTP-Referer": "https://agent-zero.ai/"
+        "X-Title": "Agent Zero"
   other:
     name: Other OpenAI compatible
     litellm_provider: openai

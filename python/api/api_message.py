@@ -68,12 +68,13 @@ class ApiMessage(ApiHandler):
 
         # Get or create context
         if context_id:
-            context = AgentContext.get(context_id)
+            context = AgentContext.use(context_id)
             if not context:
                 return Response('{"error": "Context not found"}', status=404, mimetype="application/json")
         else:
             config = initialize_agent()
             context = AgentContext(config=config, type=AgentContextType.USER)
+            AgentContext.use(context.id)
             context_id = context.id
 
         # Update chat lifetime

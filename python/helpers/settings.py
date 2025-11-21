@@ -11,7 +11,7 @@ from python.helpers import runtime, whisper, defer, git
 from . import files, dotenv
 from python.helpers.print_style import PrintStyle
 from python.helpers.providers import get_providers
-from python.helpers.secrets import SecretsManager
+from python.helpers.secrets import get_default_secrets_manager
 from python.helpers import dirty_json
 
 
@@ -110,6 +110,8 @@ class Settings(TypedDict):
 
     # LiteLLM global kwargs applied to all model calls
     litellm_global_kwargs: dict[str, Any]
+
+    update_check_enabled: bool
 
 class PartialSettings(Settings, total=False):
     pass
@@ -1110,7 +1112,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
    # Secrets section
     secrets_fields: list[SettingsField] = []
 
-    secrets_manager = SecretsManager.get_instance()
+    secrets_manager = get_default_secrets_manager()
     try:
         secrets = secrets_manager.get_masked_secrets()
     except Exception:
@@ -1217,6 +1219,27 @@ def convert_out(settings: Settings) -> SettingsOutput:
         "tab": "external",
     }
 
+    # update checker section
+    update_checker_fields: list[SettingsField] = []
+
+    update_checker_fields.append(
+        {
+            "id": "update_check_enabled",
+            "title": "Enable Update Checker",
+            "description": "Enable update checker to notify about newer versions of Agent Zero.",
+            "type": "switch",
+            "value": settings["update_check_enabled"],
+        }
+    )
+
+    update_checker_section: SettingsSection = {
+        "id": "update_checker",
+        "title": "Update Checker",
+        "description": "Update checker periodically checks for new releases of Agent Zero and will notify when an update is recommended.<br>No personal data is sent to the update server, only randomized+anonymized unique ID and current version number, which help us evaluate the importance of the update in case of critical bug fixes etc.",
+        "fields": update_checker_fields,
+        "tab": "external",
+    }
+
     # Backup & Restore section
     backup_fields: list[SettingsField] = []
 
@@ -1269,6 +1292,7 @@ def convert_out(settings: Settings) -> SettingsOutput:
             mcp_server_section,
             a2a_section,
             external_api_section,
+            update_checker_section,
             backup_section,
             dev_section,
             # code_exec_section,
@@ -1332,6 +1356,12 @@ def set_settings_delta(delta: dict, apply: bool = True):
     current = get_settings()
     new = {**current, **delta}
     set_settings(new, apply)  # type: ignore
+
+
+def merge_settings(original: Settings, delta: dict) -> Settings:
+    merged = original.copy()
+    merged.update(delta)
+    return merged
 
 
 def normalize_settings(settings: Settings) -> Settings:
@@ -1417,10 +1447,9 @@ def _write_sensitive_settings(settings: Settings):
         set_root_password(settings["root_password"])
 
     # Handle secrets separately - merge with existing preserving comments/order and support deletions
-    secrets_manager = SecretsManager.get_instance()
+    secrets_manager = get_default_secrets_manager()
     submitted_content = settings["secrets"]
     secrets_manager.save_secrets_with_merge(submitted_content)
-    secrets_manager.clear_cache()  # Clear cache to reload secrets
 
 
 
@@ -1503,6 +1532,7 @@ def get_default_settings() -> Settings:
         variables="",
         secrets="",
         litellm_global_kwargs={},
+        update_check_enabled=True,
     )
 
 
@@ -1707,8 +1737,4 @@ def create_auth_token() -> str:
 
 
 def _get_version():
-    try:
-        git_info = git.get_git_info()
-        return str(git_info.get("short_tag", "")).strip() or "unknown"
-    except Exception:
-        return "unknown"
+    return git.get_version()

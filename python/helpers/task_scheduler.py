@@ -22,6 +22,7 @@ from python.helpers.print_style import PrintStyle
 from python.helpers.defer import DeferredTask
 from python.helpers.files import get_abs_path, make_dirs, read_file, write_file
 from python.helpers.localization import Localization
+from python.helpers import projects
 import pytz
 from typing import Annotated
 
@@ -124,6 +125,8 @@ class BaseTask(BaseModel):
     system_prompt: str
     prompt: str
     attachments: list[str] = Field(default_factory=list)
+    project_name: str | None = Field(default=None)
+    project_color: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_run: datetime | None = None
@@ -180,6 +183,9 @@ class BaseTask(BaseModel):
 
     def get_next_run(self) -> datetime | None:
         return None
+
+    def is_dedicated(self) -> bool:
+        return self.context_id == self.uuid
 
     def get_next_run_minutes(self) -> int | None:
         next_run = self.get_next_run()
@@ -243,14 +249,18 @@ class AdHocTask(BaseTask):
         prompt: str,
         token: str,
         attachments: list[str] = list(),
-        context_id: str | None = None
+        context_id: str | None = None,
+        project_name: str | None = None,
+        project_color: str | None = None
     ):
         return cls(name=name,
                    system_prompt=system_prompt,
                    prompt=prompt,
                    attachments=attachments,
                    token=token,
-                   context_id=context_id)
+                   context_id=context_id,
+                   project_name=project_name,
+                   project_color=project_color)
 
     def update(self,
                name: str | None = None,
@@ -288,7 +298,9 @@ class ScheduledTask(BaseTask):
         schedule: TaskSchedule,
         attachments: list[str] = list(),
         context_id: str | None = None,
-        timezone: str | None = None
+        timezone: str | None = None,
+        project_name: str | None = None,
+        project_color: str | None = None,
     ):
         # Set timezone in schedule if provided
         if timezone is not None:
@@ -301,7 +313,9 @@ class ScheduledTask(BaseTask):
                    prompt=prompt,
                    attachments=attachments,
                    schedule=schedule,
-                   context_id=context_id)
+                   context_id=context_id,
+                   project_name=project_name,
+                   project_color=project_color)
 
     def update(self,
                name: str | None = None,
@@ -365,14 +379,18 @@ class PlannedTask(BaseTask):
         prompt: str,
         plan: TaskPlan,
         attachments: list[str] = list(),
-        context_id: str | None = None
+        context_id: str | None = None,
+        project_name: str | None = None,
+        project_color: str | None = None
     ):
         return cls(name=name,
                    system_prompt=system_prompt,
                    prompt=prompt,
                    plan=plan,
                    attachments=attachments,
-                   context_id=context_id)
+                   context_id=context_id,
+                   project_name=project_name,
+                   project_color=project_color)
 
     def update(self,
                name: str | None = None,
@@ -719,6 +737,10 @@ class TaskScheduler:
         # initial name before renaming is same as task name
         # context.name = task.name
 
+        # Activate project if set
+        if task.project_name:
+            projects.activate_project(context.id, task.project_name)
+
         # Save the context
         save_tmp_chat(context)
         return context
@@ -776,6 +798,7 @@ class TaskScheduler:
                 self._printer.print(f"Scheduler Task '{current_task.name}' started")
 
                 context = await self._get_chat_context(current_task)
+                AgentContext.use(context.id)
 
                 # Ensure the context is properly registered in the AgentContext._contexts
                 # This is critical for the polling mechanism to find and stream logs
@@ -1036,12 +1059,19 @@ def serialize_task(task: Union[ScheduledTask, AdHocTask, PlannedTask]) -> Dict[s
         "system_prompt": task.system_prompt,
         "prompt": task.prompt,
         "attachments": task.attachments,
+        "project_name": task.project_name,
+        "project_color": task.project_color,
         "created_at": serialize_datetime(task.created_at),
         "updated_at": serialize_datetime(task.updated_at),
         "last_run": serialize_datetime(task.last_run),
         "next_run": serialize_datetime(task.get_next_run()),
         "last_result": task.last_result,
-        "context_id": task.context_id
+        "context_id": task.context_id,
+        "dedicated_context": task.is_dedicated(),
+        "project": {
+            "name": task.project_name,
+            "color": task.project_color,
+        },
     }
 
     # Add type-specific fields
@@ -1101,11 +1131,13 @@ def deserialize_task(task_data: Dict[str, Any], task_class: Optional[Type[T]] = 
         "system_prompt": task_data.get("system_prompt", ""),
         "prompt": task_data.get("prompt", ""),
         "attachments": task_data.get("attachments", []),
+        "project_name": task_data.get("project_name"),
+        "project_color": task_data.get("project_color"),
         "created_at": parse_datetime(task_data.get("created_at")),
         "updated_at": parse_datetime(task_data.get("updated_at")),
         "last_run": parse_datetime(task_data.get("last_run")),
         "last_result": task_data.get("last_result"),
-        "context_id": task_data.get("context_id")
+        "context_id": task_data.get("context_id"),
     }
 
     # Add type-specific fields

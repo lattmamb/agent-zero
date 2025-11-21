@@ -8,7 +8,7 @@ class RemoveChat(ApiHandler):
     async def process(self, input: Input, request: Request) -> Output:
         ctxid = input.get("context", "")
 
-        context = AgentContext.get(ctxid)
+        context = AgentContext.use(ctxid)
         if context:
             # stop processing any tasks
             context.reset()
